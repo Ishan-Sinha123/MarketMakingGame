@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Tuple, Literal
+from collections import deque
 
 @dataclass
 class OrderType:
@@ -71,37 +72,81 @@ class MarketMaker(ABC):
         pass
 
 class SimpleMarketMaker(MarketMaker):
+
+    def __init__(self, risk_aversion: float = 0.1, base_spread_factor: float = 0.01, volatility_window: int = 10, 
+                 num_simulations: int = 1000, forecast_horizon: int = 10):
         """
-        An example on how to implement a market maker.
+        :param risk_aversion: Adjusts bid and ask prices based on inventory levels.
+        :param base_spread_factor: Base factor for determining spread size as a percentage of the mid-price.
+        :param volatility_window: Number of recent mid-prices used for volatility calculation.
+        :param num_simulations: Number of Monte Carlo simulations to run.
+        :param forecast_horizon: Number of future steps for price forecasting.
         """
-        def __init__(self):
-             pass
-        
-        # TODO: Replace this example with your strategy
-        def update(self, prev_bid_price, prev_ask_price, holding, money, timestamp) -> Tuple[float, int, float, int, OrderType]:
-            """
-            Example on how to implement the update method for the market maker.
+        self.risk_aversion = risk_aversion
+        self.base_spread_factor = base_spread_factor
+        self.volatility_window = volatility_window
+        self.num_simulations = num_simulations
+        self.forecast_horizon = forecast_horizon
+        self.mid_prices = deque(maxlen=volatility_window)
 
-            This example will return the previous bid price and ask price, and the volume to buy and sell
-            as 100, and a new limit order with the timestamp and timestamp + 100.
+    def simulate_price_paths(self, current_price: float, volatility: float) -> np.ndarray:
+        """
+        Simulate future price paths using Geometric Brownian Motion (GBM).
+        """
+        dt = 1  # Time step
+        drift = 0  # Assumes no drift
+        random_shocks = np.random.normal(0, 1, (self.forecast_horizon, self.num_simulations))
+        price_paths = np.zeros((self.forecast_horizon + 1, self.num_simulations))
+        price_paths[0] = current_price
 
-            To return a market order, you can use OrderType.new_market_order(timestamp)
-            ```
-            return prev_bid_price, 100, prev_ask_price, 100, OrderType.new_market_order(timestamp)
-            ```
-            For market order, the limit price will be defaulted to the market bid and ask price.
+        for t in range(1, self.forecast_horizon + 1):
+            price_paths[t] = price_paths[t - 1] * np.exp((drift - 0.5 * volatility**2) * dt + volatility * np.sqrt(dt) * random_shocks[t - 1])
 
-            Note that the volume to buy and sell can be any integer value, including 0. If the volume is negative,
-            it will be set to 0. If the volume to sell is more than the holding, it will be set to the holding.
+        return price_paths
 
-            :param prev_bid_price: the previous bid price
-            :param prev_ask_price: the previous ask price
-            :param holding: the number of stocks you are holding from previous interval
-            :param money: the amount of money you have from previous interval
-            :param timestamp: the timestamp of the current (not previous) interval
+    def update(self, prev_bid_price, prev_ask_price, holding, money, timestamp) -> Tuple[float, int, float, int, OrderType]:
+        """
+        Update the bid and ask prices using Monte Carlo simulations with safeguards for invalid values.
 
-            :return: a tuple containing the new bid price limit, the volume to buy, the new ask price limit,
-            the volume to sell, and the order type as OrderType object
+        :param prev_bid_price: Previous bid price.
+        :param prev_ask_price: Previous ask price.
+        :param holding: Current inventory.
+        :param money: Current cash.
+        :param timestamp: Current time step.
+        :return: Tuple of bid price, bid size, ask price, ask size, and order type.
+        """
+        # Ensure valid inputs
+        prev_bid_price = max(0.01, prev_bid_price)
+        prev_ask_price = max(0.01, prev_ask_price)
 
-            """
-            return prev_bid_price, 100, prev_ask_price, 100, OrderType.new_limit_order(timestamp, timestamp + 100)
+        # Calculate mid-price and update history
+        mid_price = (prev_bid_price + prev_ask_price) / 2
+        self.mid_prices.append(mid_price)
+
+        # Calculate volatility
+        if len(self.mid_prices) > 1:
+            volatility = max(0.0001, np.std(self.mid_prices))
+        else:
+            volatility = 0.01
+
+        # Simulate future price paths
+        price_paths = self.simulate_price_paths(mid_price, volatility)
+        simulated_bid = np.percentile(price_paths[-1], 10)
+        simulated_ask = np.percentile(price_paths[-1], 90)
+
+        # Ensure reasonable bid and ask prices
+        simulated_bid = max(0.01, simulated_bid)
+        simulated_ask = max(simulated_bid + 0.01, simulated_ask)
+
+        # Adjust for inventory and risk
+        inventory_adjustment = self.risk_aversion * holding
+        new_bid_price = max(0.01, simulated_bid - inventory_adjustment)
+        new_ask_price = max(new_bid_price + 0.01, simulated_ask - inventory_adjustment)
+
+        # Validate plus cap order sizes
+        bid_size = max(1, int(money / max(new_bid_price, 0.01) * 0.1)) if new_bid_price > 0 else 0
+        ask_size = max(1, abs(holding)) if holding > 0 else 0
+
+        order_type = OrderType.new_limit_order(from_time=timestamp, to_time=timestamp + 1)
+
+        return new_bid_price, bid_size, new_ask_price, ask_size, order_type
