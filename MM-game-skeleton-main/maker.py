@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Tuple, Literal
 from collections import deque
+import numpy as np
 
 @dataclass
 class OrderType:
